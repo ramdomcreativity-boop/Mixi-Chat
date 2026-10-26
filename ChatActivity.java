@@ -4,30 +4,14 @@
 
 
 // ============================================================
-// MIXI CHAT — ChatActivity (Delta Sync + Send-First build)
+// MIXI CHAT — ChatActivity (Bounded Real-Time Sync + Send-First build)
 // Paste into: Chat screen -> onCreate -> Add Source Directly
 //
-// CHANGES IN THIS VERSION (everything else is unchanged):
-//  1. keepSynced(true) on the FULL message history is REMOVED.
-//  2. DELTA SYNC: every write to a message now also sets "updatedAt"
-//     (server time). On open, the chat shows the local cache instantly and
-//     asks Firebase ONLY for messages with updatedAt >= lastSync
-//     (new messages, reactions, edits, deletes, status changes).
-//     First-ever open (no cache) falls back to limitToLast(60) once.
-//  3. lastSync is saved together with the cache (same commit), and only
-//     after the cache has been merged, so cache and lastSync can never
-//     disagree.
-//  4. relationships listener now reads only this pair (not the whole node).
-//  5. users/{otherUid} is now read as small separate fields, not the whole node.
-//  6. Secondary listeners attach AFTER the message listeners so nothing
-//     competes with sending.
-//  7. FIX: onChildRemoved on a limitToLast query also fires when an old
-//     message is just pushed out of the window; it is now verified against
-//     the server before marking a message deleted.
-//  8. FIX: markRead waits until your privacy settings are loaded.
+// Cached messages render immediately while Firebase streams child-level
+// changes to a bounded, continuously attached timestamp query.
 //
 // REQUIRED in Firebase Realtime Database rules (under "messages"):
-//   "messages": { "$pairId": { ".indexOn": ["updatedAt"] } }
+//   "messages": { "$pairId": { ".indexOn": ["timestamp"] } }
 // ============================================================
 
 try {
@@ -64,13 +48,11 @@ final String cacheKey = "chat_cache_" + pairId;
 final String pendingCacheKey = "chat_pending_" + pairId;
 final String profileCacheKey = "profile_cache_" + otherUid;
 
-// ---------- DELTA SYNC: decide how this open will sync ----------
-final String lastSyncKey = "chat_lastsync_" + pairId;
-final long lastSyncAtOpen = cachePrefs.getLong(lastSyncKey, 0L);
-final boolean useDeltaSync = lastSyncAtOpen > 0L && cachePrefs.contains(cacheKey);
-final com.google.firebase.database.Query activeMessagesQuery = useDeltaSync
-    ? chatMessagesRef.orderByChild("updatedAt").startAt((double) lastSyncAtOpen)
-    : chatMessagesRecentQuery;
+// Keep one bounded, continuous live window ordered by the immutable message
+// timestamp. A mutable updatedAt delta cursor can move records across its
+// query boundary (including status/read-receipt writes), causing missed events.
+final com.google.firebase.database.Query activeMessagesQuery = chatMessagesRef
+    .orderByChild("timestamp").limitToLast(60);
 // True only after the local cache has been merged into messageList. The cache
 // is never written before this, so a half-loaded list can't overwrite it.
 final boolean[] cacheMerged = { false };
@@ -2949,7 +2931,6 @@ final Runnable rebuildMessages = new Runnable() {
                     @Override public void run() {
                         try {
                             org.json.JSONArray arr = new org.json.JSONArray();
-                            long maxUpdatedAt = 0L;
                             for (ChatMessageItem m : cacheSnapshot) {
                                 org.json.JSONObject obj = new org.json.JSONObject();
                                 obj.put("id", m.id); obj.put("senderId", m.senderId); obj.put("receiverId", m.receiverId);
@@ -2967,7 +2948,6 @@ final Runnable rebuildMessages = new Runnable() {
                                 // restart shows the bubble immediately.
                                 obj.put("type", m.type); obj.put("audioDurationSeconds", m.audioDurationSeconds);
                                 obj.put("updatedAt", m.updatedAt);
-                                if (m.updatedAt > maxUpdatedAt) maxUpdatedAt = m.updatedAt;
                                 if (m.waveformSamples != null) {
                                     org.json.JSONArray wfArr = new org.json.JSONArray();
                                     for (int lvl : m.waveformSamples) wfArr.put(lvl);
@@ -2975,16 +2955,9 @@ final Runnable rebuildMessages = new Runnable() {
                                 }
                                 arr.put(obj);
                             }
-                            // Cache + lastSync are written in ONE commit so they can
-                            // never disagree. A 5s safety margin is subtracted so a
-                            // slightly-off local estimate of the server clock can
-                            // never make the next open skip a change.
+                            // Persist the local message cache as one snapshot.
                             android.content.SharedPreferences.Editor editor = cachePrefs.edit();
                             editor.putString(cacheKey, arr.toString());
-                            if (maxUpdatedAt > 0L) {
-                                long newSync = Math.max(cachePrefs.getLong(lastSyncKey, 0L), maxUpdatedAt - 5000L);
-                                editor.putLong(lastSyncKey, newSync);
-                            }
                             editor.commit();
                         } catch (Throwable ignored) {}
                     }
@@ -3009,7 +2982,9 @@ class RebuildScheduler {
                 rebuildMessages.run();
             }
         };
-        mainHandler.postDelayed(pendingRebuildRunnable[0], 30);
+        // Firebase child callbacks are already delivered on the main thread;
+        // use a single frame-sized coalescing window for bursts.
+        mainHandler.postDelayed(pendingRebuildRunnable[0], 16);
     }
 }
 final RebuildScheduler rebuildScheduler = new RebuildScheduler();
@@ -3137,13 +3112,10 @@ persistenceExecutor.execute(new Runnable() {
                 for (java.util.Map.Entry<String, java.util.Map<String, Object>> entry : loadedPending.entrySet()) {
                     if (!pendingPayloads.containsKey(entry.getKey())) pendingPayloads.put(entry.getKey(), entry.getValue());
                 }
-                // From now on it is safe to write the cache + lastSync.
+                // Cache now contains all successfully parsed local messages.
                 cacheMerged[0] = true;
-                // If the cache was unreadable but we were in delta mode, the
-                // history would be incomplete — drop lastSync and re-fetch the
-                // recent window once.
-                if (cacheLoadFailed[0] && useDeltaSync) {
-                    cachePrefs.edit().remove(lastSyncKey).apply();
+                // Recover the recent window if the local cache was unreadable.
+                if (cacheLoadFailed[0]) {
                     if (fullRecoveryHolder[0] != null) fullRecoveryHolder[0].run();
                 }
                 if (!loadedItems.isEmpty() || !messageList.isEmpty()) rebuildMessagesHolder[0].run();
@@ -3485,7 +3457,7 @@ class FastMessageUpdateHelper {
 }
 final FastMessageUpdateHelper fastMessageUpdates = new FastMessageUpdateHelper();
 
-// Recovery path (unreadable cache while in delta mode): fetch the recent window once.
+// Recovery path (unreadable cache): fetch the recent window once.
 fullRecoveryHolder[0] = new Runnable() {
     @Override public void run() {
         chatMessagesRecentQuery.addListenerForSingleValueEvent(new com.google.firebase.database.ValueEventListener() {
@@ -3570,22 +3542,30 @@ retryPendingSends[0] = new Runnable() {
     }
 };
 
-// ===== PRIORITY 1: the message listeners (delta query, or limitToLast(60) on a first open) =====
-activeMessagesQuery.addChildEventListener(new com.google.firebase.database.ChildEventListener() {
+// ===== PRIORITY 1: persistent listener for the latest 60 messages =====
+final com.google.firebase.database.ChildEventListener messageListener = new com.google.firebase.database.ChildEventListener() {
+    void syncAfterChange() {
+        messagesLoaded[0] = true;
+        messageSync.markDelivered();
+        if (isChatVisible[0] && myPrivacyLoaded[0]) messageSync.markRead();
+        if (!hasInitializedBarrier[0]) barrierHelper.checkAndInit();
+    }
     @Override public void onChildAdded(com.google.firebase.database.DataSnapshot snap, String previousChildKey) {
         fastMessageUpdates.upsert(snap);
-        messagesLoaded[0] = true;
-        if (!hasInitializedBarrier[0]) barrierHelper.checkAndInit();
+        syncAfterChange();
     }
     @Override public void onChildChanged(com.google.firebase.database.DataSnapshot snap, String previousChildKey) {
         fastMessageUpdates.upsert(snap);
+        syncAfterChange();
     }
     @Override public void onChildRemoved(com.google.firebase.database.DataSnapshot snap) {
         fastMessageUpdates.remove(snap);
+        syncAfterChange();
     }
     @Override public void onChildMoved(com.google.firebase.database.DataSnapshot snap, String previousChildKey) {}
     @Override public void onCancelled(com.google.firebase.database.DatabaseError error) {}
-});
+};
+activeMessagesQuery.addChildEventListener(messageListener);
 
 // Listen to own unreadCount independently to enforce zeroing regardless of read receipts setting
 rootRef.child("conversations").child(pairId).child("unreadCount").child(myUid).addValueEventListener(new com.google.firebase.database.ValueEventListener() {
@@ -3631,21 +3611,6 @@ rootRef.child("users").child(myUid).child("privacy").addValueEventListener(new c
     }
     @Override
     public void onCancelled(com.google.firebase.database.DatabaseError error) {}
-});
-
-// Side-effects of the message query (delivered/read marking, unread barrier).
-// The ChildEventListener above already keeps messageList in sync, so this does
-// not re-upsert anything.
-activeMessagesQuery.addValueEventListener(new com.google.firebase.database.ValueEventListener() {
-    @Override public void onDataChange(com.google.firebase.database.DataSnapshot snapshot) {
-        messagesLoaded[0] = true;
-        messageSync.markDelivered();
-        // Wait for my privacy settings so a receipts-off user is never marked "read".
-        if (isChatVisible[0] && myPrivacyLoaded[0]) messageSync.markRead();
-        if (!hasInitializedBarrier[0]) barrierHelper.checkAndInit();
-        else rebuildScheduler.schedule();
-    }
-    @Override public void onCancelled(com.google.firebase.database.DatabaseError error) {}
 });
 
 rootRef.child(".info/connected").addValueEventListener(new com.google.firebase.database.ValueEventListener() {
