@@ -347,60 +347,6 @@ final Runnable persistViewedWithoutReadReceipts = new Runnable() {
 };
 final java.util.concurrent.ExecutorService persistenceExecutor = java.util.concurrent.Executors.newSingleThreadExecutor();
 
-// ---------- External push-notification webhook ----------
-// Runs only after the corresponding /messages/{pairId}/{messageId} write
-// has completed successfully. No message text or audio payload is sent.
-class NotificationWebhookHelper {
-    private final String webhookUrl = "https://script.google.com/macros/s/AKfycbyLFL6xyb1Yzy_u-MzJP5iRTaUYYlbUKXPwUAPAee9YIXrxMPEpb7ZrQIWdYkbAvCHi/exec";
-    private final String webhookSecret = "MixiChat_Notify_9xK7pQ2m_2026";
-
-    void send(final String senderId, final String receiverId, final String pairId, final String messageId) {
-        persistenceExecutor.execute(new Runnable() {
-            @Override public void run() {
-                java.net.HttpURLConnection connection = null;
-                java.io.OutputStream output = null;
-                java.io.InputStream input = null;
-                try {
-                    org.json.JSONObject payload = new org.json.JSONObject();
-                    payload.put("secret", webhookSecret);
-                    payload.put("senderId", senderId);
-                    payload.put("receiverId", receiverId);
-                    payload.put("pairId", pairId);
-                    payload.put("messageId", messageId);
-
-                    byte[] body = payload.toString().getBytes("UTF-8");
-                    java.net.URL url = new java.net.URL(webhookUrl);
-                    connection = (java.net.HttpURLConnection) url.openConnection();
-                    connection.setRequestMethod("POST");
-                    connection.setConnectTimeout(15000);
-                    connection.setReadTimeout(15000);
-                    connection.setDoOutput(true);
-                    connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-                    connection.setFixedLengthStreamingMode(body.length);
-
-                    output = connection.getOutputStream();
-                    output.write(body);
-                    output.flush();
-
-                    int responseCode = connection.getResponseCode();
-                    input = responseCode >= 400 ? connection.getErrorStream() : connection.getInputStream();
-                    if (input != null) {
-                        byte[] buffer = new byte[1024];
-                        while (input.read(buffer) != -1) {}
-                    }
-                } catch (Throwable ignored) {
-                    // Notification failure must never affect message delivery or the UI.
-                } finally {
-                    try { if (input != null) input.close(); } catch (Throwable ignored) {}
-                    try { if (output != null) output.close(); } catch (Throwable ignored) {}
-                    if (connection != null) connection.disconnect();
-                }
-            }
-        });
-    }
-}
-final NotificationWebhookHelper notificationWebhook = new NotificationWebhookHelper();
-
 class PendingPersistHelper {
     void save() {
         final java.util.HashSet<String> snapshot = new java.util.HashSet<String>(pendingSendIds);
@@ -1264,7 +1210,6 @@ finishRecordingHolder[0] = new Runnable() {
                                     pendingSendIds.remove(newMsgId);
                                     pendingPayloads.remove(newMsgId);
                                     pendingPersist.save();
-                                    notificationWebhook.send(myUid, otherUid, pairId, newMsgId);
                                 } else {
                                     pendingSendIds.add(newMsgId);
                                     pendingPersist.save();
@@ -3336,7 +3281,6 @@ sendBtn.setOnClickListener(new android.view.View.OnClickListener() {
                     pendingSendIds.remove(newMsgId);
                     pendingPayloads.remove(newMsgId);
                     pendingPersist.save();
-                    notificationWebhook.send(myUid, otherUid, pairId, newMsgId);
                 } else {
                     pendingSendIds.add(newMsgId);
                     pendingPersist.save();

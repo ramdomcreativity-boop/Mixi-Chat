@@ -20,6 +20,10 @@ if (currentUser == null) {
     return;
 }
 
+// Re-fetch on authenticated startup so tokens created before login are bound
+// to this account; onNewToken handles subsequent rotations.
+com.fahad.daud.mixichat.MyFirebaseMessagingService.registerCurrentToken(getApplicationContext());
+
 // ---------- Battery optimization exemption (ask once) ----------
 android.content.SharedPreferences batteryPrefs = getSharedPreferences("MixiPrefs", android.content.Context.MODE_PRIVATE);
 if (!batteryPrefs.getBoolean("asked_battery_exemption", false)) {
@@ -124,6 +128,21 @@ if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
 }
 
 final java.util.Map<String, com.google.firebase.database.ValueEventListener> messageWatchListeners = new java.util.HashMap<>();
+
+class AppForegroundState {
+    boolean isForeground() {
+        android.app.ActivityManager manager = (android.app.ActivityManager) getSystemService(android.content.Context.ACTIVITY_SERVICE);
+        if (manager == null) return false;
+        java.util.List<android.app.ActivityManager.RunningAppProcessInfo> processes = manager.getRunningAppProcesses();
+        if (processes == null) return false;
+        for (android.app.ActivityManager.RunningAppProcessInfo process : processes) {
+            if (getPackageName().equals(process.processName))
+                return process.importance == android.app.ActivityManager.RunningAppProcessInfo.IMPORTANCE_FOREGROUND;
+        }
+        return false;
+    }
+}
+final AppForegroundState appForegroundState = new AppForegroundState();
 
 class MessageNotifier {
     void showNotification(final String otherUid, final String name, final String photoURL, final String message) {
@@ -302,7 +321,11 @@ rootRef.child("relationships").addValueEventListener(new com.google.firebase.dat
                                     if (reacted.length() > 15) reacted = reacted.substring(0, 15).trim() + "…";
                                     notificationText = (name == null ? "Someone" : name) + " reacted " + (eventEmoji == null ? "" : eventEmoji) + " to " + reacted;
                                 }
-                                messageNotifier.showNotification(otherUid, name == null ? "Someone" : name, photoURL, notificationText);
+                                // MainActivity owns notifications only while the process is foregrounded.
+                                // Background delivery belongs to FCM to avoid two notification sources.
+                                if (appForegroundState.isForeground()) {
+                                    messageNotifier.showNotification(otherUid, name == null ? "Someone" : name, photoURL, notificationText);
+                                }
                             }
                             @Override public void onCancelled(com.google.firebase.database.DatabaseError e) {}
                         });

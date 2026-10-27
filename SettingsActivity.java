@@ -1122,13 +1122,24 @@ logoutBtn.setOnClickListener(new android.view.View.OnClickListener() {
         netUtils.executeIfOnline(SettingsActivity.this, new Runnable() {
             public void run() {
                 try { rootRef.child("users").child(myUid).child("status").child("state").setValue("offline"); } catch (Exception e) {}
-                firebaseAuth.signOut();
-                try {
-                    android.content.Intent intent = new android.content.Intent(SettingsActivity.this, Class.forName(getPackageName() + ".LoginActivity"));
-                    intent.setFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK | android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK);
-                    startActivity(intent);
-                    finish();
-                } catch (Exception e) { finish(); }
+                final Runnable completeLogout = new Runnable() {
+                    @Override public void run() {
+                        firebaseAuth.signOut();
+                        try {
+                            android.content.Intent intent = new android.content.Intent(SettingsActivity.this, Class.forName(getPackageName() + ".LoginActivity"));
+                            intent.setFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK | android.content.Intent.FLAG_ACTIVITY_CLEAR_TASK);
+                            startActivity(intent);
+                            finish();
+                        } catch (Exception e) { finish(); }
+                    }
+                };
+                com.fahad.daud.mixichat.MyFirebaseMessagingService.removeCurrentInstallationToken(SettingsActivity.this)
+                    .addOnCompleteListener(SettingsActivity.this, new com.google.android.gms.tasks.OnCompleteListener<Void>() {
+                        @Override public void onComplete(com.google.android.gms.tasks.Task<Void> task) {
+                            // Logout must still complete if token cleanup is denied or offline.
+                            completeLogout.run();
+                        }
+                    });
             }
         }, null);
     }
